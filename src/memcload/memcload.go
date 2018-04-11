@@ -30,7 +30,7 @@ type AppsInstalled struct {
 	DeviceID   string
 	Lat        float64
 	Lon        float64
-	Apps       []int
+	Apps       []uint32
 }
 
 // Алиас к wg.Done. Нужно жать когда работа с задачей завершена
@@ -156,10 +156,10 @@ func ParseAppInstalled(line string) (*AppsInstalled, error) {
 		return c == ','
 	}
 	stringApps := strings.FieldsFunc(lineparts[4], iscomma)
-	apps := make([]int)
+	apps := make([]uint32, len(stringApps))
 	for _, app range stringApps {
-		if appNumber, err := strconv.ParseInt(app, 10, 0); err == nil {
-			apps = append(apps, int(appNumber))
+		if appNumber, err := strconv.ParseUint(app, 10, 32); err == nil {
+			apps = append(apps, uint32(appNumber))
 		} else {
 			log.Fatalf("Invalid app number: `%s`", app)
 		}
