@@ -100,6 +100,7 @@ func (task *Task) Success() {
 	return tasks, nil
 } */
 
+// Serialize сериализует protobuf-сообщение из структуры AppsInstalled
 func (apps *AppsInstalled) Serialize() (string, *[]byte, error) {
 	ua := &appsinstalled.UserApps{
 		Lat:  &apps.Lat,
@@ -117,6 +118,7 @@ func (apps *AppsInstalled) Serialize() (string, *[]byte, error) {
 	return key, &packed, err
 }
 
+// ParseAppInstalled парсит строку и возвращает структуру типа AppsInstalled
 func ParseAppInstalled(line string) (*AppsInstalled, error) {
 	lineparts := strings.Fields(line)
 	if len(lineparts) < 5 {
@@ -185,28 +187,28 @@ func prototest() bool {
 		}
 		data, err := proto.Marshal(ua)
 		if err != nil {
-			log.Printf("Marshaling error: ", err)
+			log.Printf("Marshaling error: %s", err)
 			result = false
 		}
 		unpackedua := &appsinstalled.UserApps{}
 		err = proto.Unmarshal(data, unpackedua)
 		if err != nil {
-			log.Printf("Unmarshaling error: ", err)
+			log.Printf("Unmarshaling error: %s", err)
 			result = false
 		}
 		testApps := unpackedua.GetApps()
 		for i, app := range ua.GetApps() {
 			if app != testApps[i] {
 				result = false
-				log.Printf("Apps mismatch %q != %q", app, testApps[i])
+				log.Printf("Apps mismatch %d != %d", app, testApps[i])
 			}
 		}
 		if ua.GetLat() != unpackedua.GetLat() {
-			log.Printf("Latitude mismatch %q != %q", ua.GetLat(), unpackedua.GetLat())
+			log.Printf("Latitude mismatch %f != %f", ua.GetLat(), unpackedua.GetLat())
 			result = false
 		}
 		if ua.GetLon() != unpackedua.GetLon() {
-			log.Printf("Longitude mismatch %q != %q", ua.GetLon(), unpackedua.GetLon())
+			log.Printf("Longitude mismatch %f != %f", ua.GetLon(), unpackedua.GetLon())
 			result = false
 		}
 	}
