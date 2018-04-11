@@ -1,18 +1,15 @@
 package main
 
 import (
-	"errors"
-	"log"
 	"appsinstalled"
 	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
-	"sync"
-	"github.com/golang/protobuf/proto"
-	"strings"
+	"log"
 	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/golang/protobuf/proto"
 )
 
 // Структура для хранения задачи в процессе ее выполнения
@@ -31,13 +28,6 @@ type AppsInstalled struct {
 	Lat        float64
 	Lon        float64
 	Apps       []uint32
-}
-
-// Алиас к wg.Done. Нужно жать когда работа с задачей завершена
-func (task *Task) Done() {
-	task.doneOnce.Do(func() {
-		task.wg.Done()
-	})
 }
 
 // Проверка что задача завершена. Либо успешно выполнена, либо закончились попытки
@@ -68,7 +58,7 @@ func (task *Task) Success() {
 
 // Горутина-воркер. Берет из queue задачу и пытается обработать.
 // В результате либо завершает ее, либо кладет в конец очереди на повторную обработку
-func worker(queue chan *Task, exit chan bool) {
+/* func worker(queue chan *Task, exit chan bool) {
 	for {
 		select {
 		case task := <-queue:
@@ -90,16 +80,12 @@ func worker(queue chan *Task, exit chan bool) {
 			return
 		}
 	}
-}
+} */
 
 // создание задач
-func GetTasks(files []string) ([]*Task, error) {
+/* func GetTasks(files []string) ([]*Task, error) {
 	var wg sync.WaitGroup
 	tasks := make([]*Task, 0)
-
-	if err != nil {
-		return tasks, err
-	}
 
 	for _, file := range files {
 		newJob := &Task{
@@ -112,14 +98,14 @@ func GetTasks(files []string) ([]*Task, error) {
 	}
 
 	return tasks, nil
-}
+} */
 
-func (apps *AppsInstalled) Serialize() (string, []*byte, error) {
+func (apps *AppsInstalled) Serialize() (string, *[]byte, error) {
 	ua := &appsinstalled.UserApps{
-		Lat: apps.Lat,
-		Lon: apps.Lon,
-		Apps: apps.Apps
-		}
+		Lat:  &apps.Lat,
+		Lon:  &apps.Lon,
+		Apps: apps.Apps,
+	}
 
 	packed, err := proto.Marshal(ua)
 	if err != nil {
@@ -128,14 +114,13 @@ func (apps *AppsInstalled) Serialize() (string, []*byte, error) {
 
 	key := fmt.Sprintf("%s:%s", apps.DeviceType, apps.DeviceID)
 
-	return key, packed, err
+	return key, &packed, err
 }
 
 func ParseAppInstalled(line string) (*AppsInstalled, error) {
 	lineparts := strings.Fields(line)
-	err := nil
-	if len(parts) < 5 {
-		return nil, errors.New("Invalid line `%s`", line)
+	if len(lineparts) < 5 {
+		return nil, fmt.Errorf("Invalid line `%s`", line)
 	}
 	devicetype := lineparts[0]
 	deviceid := lineparts[1]
@@ -157,7 +142,7 @@ func ParseAppInstalled(line string) (*AppsInstalled, error) {
 	}
 	stringApps := strings.FieldsFunc(lineparts[4], iscomma)
 	apps := make([]uint32, len(stringApps))
-	for _, app range stringApps {
+	for _, app := range stringApps {
 		if appNumber, err := strconv.ParseUint(app, 10, 32); err == nil {
 			apps = append(apps, uint32(appNumber))
 		} else {
@@ -167,26 +152,93 @@ func ParseAppInstalled(line string) (*AppsInstalled, error) {
 
 	return &AppsInstalled{
 		DeviceType: devicetype,
-		DeviceID: deviceid,
-		Lat: lat,
-		Lon: lon,
-		Apps: apps
-		}, nil
+		DeviceID:   deviceid,
+		Lat:        lat,
+		Lon:        lon,
+		Apps:       apps,
+	}, nil
+}
+
+func prototest() bool {
+	result := true
+	sample := "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
+	isline := func(c rune) bool {
+		return c == '\n'
+	}
+	iscomma := func(c rune) bool {
+		return c == ','
+	}
+	for _, line := range strings.FieldsFunc(sample, isline) {
+		parts := strings.Fields(line)
+		lat, _ := strconv.ParseFloat(parts[2], 64)
+		lon, _ := strconv.ParseFloat(parts[3], 64)
+		stringApps := strings.FieldsFunc(parts[4], iscomma)
+		apps := make([]uint32, len(stringApps))
+		for _, app := range stringApps {
+			appNumber, _ := strconv.ParseUint(app, 10, 32)
+			apps = append(apps, uint32(appNumber))
+		}
+		ua := &appsinstalled.UserApps{
+			Lat:  &lat,
+			Lon:  &lon,
+			Apps: apps,
+		}
+		data, err := proto.Marshal(ua)
+		if err != nil {
+			log.Printf("Marshaling error: ", err)
+			result = false
+		}
+		unpackedua := &appsinstalled.UserApps{}
+		err = proto.Unmarshal(data, unpackedua)
+		if err != nil {
+			log.Printf("Unmarshaling error: ", err)
+			result = false
+		}
+		testApps := unpackedua.GetApps()
+		for i, app := range ua.GetApps() {
+			if app != testApps[i] {
+				result = false
+				log.Printf("Apps mismatch %q != %q", app, testApps[i])
+			}
+		}
+		if ua.GetLat() != unpackedua.GetLat() {
+			log.Printf("Latitude mismatch %q != %q", ua.GetLat(), unpackedua.GetLat())
+			result = false
+		}
+		if ua.GetLon() != unpackedua.GetLon() {
+			log.Printf("Longitude mismatch %q != %q", ua.GetLon(), unpackedua.GetLon())
+			result = false
+		}
+	}
+	return result
 }
 
 func main() {
-	memcDevice = make(map[string]*string)
+	memcDevice := make(map[string]*string, 4)
 	memcDevice["idfa"] = flag.String("idfa", "127.0.0.1:33013", "memcIdfa")
 	memcDevice["gaid"] = flag.String("gaid", "127.0.0.1:33014", "memcGaid")
 	memcDevice["adid"] = flag.String("adid", "127.0.0.1:33015", "memcAdid")
 	memcDevice["dvid"] = flag.String("dvid", "127.0.0.1:33016", "memcDvid")
-	pattern = flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern")
-	numProc = flag.String("numProc", "4", "nCPU")
+	/* 	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern")
+	   	numProc := flag.Int("numProc", 4, "number of CPU")
+	   	attempts := flag.Int("attempts", 0, "attempts")
+	   	dryRun := flag.Bool("dryRun", false, "dry run mode") */
+	test := flag.Bool("test", false, "test run mode")
+
 	flag.Parse()
 
-	runtime.GOMAXPROCS(*numProc)
+	if *test {
+		if !prototest() {
+			log.Print("Tests failed.")
+		} else {
+			log.Print("Tests passed.")
+		}
+		return
+	}
 
-	files, err = filepath.Glob(*pattern)
+	/* 	runtime.GOMAXPROCS(*numProc)
+
+	   	files, err := filepath.Glob(*pattern)
 
 	if err != nil {
 		log.Fatal("No matching for pattern. Exit.")
@@ -225,5 +277,5 @@ func main() {
 	}
 
 	// ожидать завершение всех воркеров
-	wg.Wait()
+	   	wg.Wait() */
 }
