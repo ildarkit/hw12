@@ -1,25 +1,36 @@
 package main
 
 import (
-	//"appsinstalled"
+	"errors"
+	"log"
+	"appsinstalled"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
+	"github.com/golang/protobuf/proto"
+	"strings"
+	"strconv"
 )
 
 // Структура для хранения задачи в процессе ее выполнения
 type Task struct {
-	sync.RWMutex
-	wg       *sync.WaitGroup
-	doneOnce sync.Once
-	Attempt  int
-	Name     string
+	wg        *sync.WaitGroup
+	Attempt   int
+	Name      string
+	Error     error
+	isSuccess bool
+}
+
+// Структура, в которой храниться распаршенная запись из файла логов
+type AppsInstalled struct {
+	DeviceType string
+	DeviceID   string
+	Lat        float64
+	Lon        float64
+	Apps       []int
 }
 
 // Алиас к wg.Done. Нужно жать когда работа с задачей завершена
@@ -31,9 +42,6 @@ func (task *Task) Done() {
 
 // Проверка что задача завершена. Либо успешно выполнена, либо закончились попытки
 func (task *Task) IsFinished() bool {
-	task.RLock()
-	defer task.RUnlock()
-
 	if task.isSuccess {
 		return true
 	}
@@ -48,40 +56,12 @@ func (task *Task) IsFinished() bool {
 // Вызывается при неуспешном завершении.
 // Инкрементит количество попыток и запоминает ошибку
 func (task *Task) Fail(err error) {
-	task.Lock()
-	defer task.Unlock()
-
-	task.Attempt += 1
+	task.Attempt++
 	task.Error = err
-}
-
-// Проверяет нужно ли перекачивать файл
-// Сравнивает mtime файла из хадупа с mtime локального файла
-// updated/part-00000.gz-mtime
-func (task *Task) IsUpdated() bool {
-	p, _ := url.Parse(task.URL)
-	_, file := path.Split(p.Path)
-
-	mtimeFile := path.Join(task.DataRoot, "updated", fmt.Sprintf("%s-mtime", file))
-
-	stat, err := os.Stat(mtimeFile)
-
-	if err != nil {
-		return false
-	}
-
-	if stat.ModTime().Unix() == task.SourceTime/1000 {
-		return true
-	}
-
-	return false
 }
 
 // Помечает задачу как выполненную. При этом нужно создать файл с mtime
 func (task *Task) Success() {
-	task.Lock()
-	defer task.Unlock()
-
 	task.Error = nil
 	task.isSuccess = true
 }
@@ -113,7 +93,7 @@ func worker(queue chan *Task, exit chan bool) {
 }
 
 // создание задач
-func getTasks(files []string) ([]*Task, error) {
+func GetTasks(files []string) ([]*Task, error) {
 	var wg sync.WaitGroup
 	tasks := make([]*Task, 0)
 
@@ -122,22 +102,9 @@ func getTasks(files []string) ([]*Task, error) {
 	}
 
 	for _, file := range files {
-		if !strings.HasPrefix(file.Name, "part-") {
-			continue
-		}
-
-		fileURL := file.OpenURL()
-		if useMirrors {
-			fileURL = file.MirrorURL()
-		}
 		newJob := &Task{
 			wg:   &wg,
 			Name: file.Name,
-		}
-
-		// Пропустить файлы, которые не нужно качать так как они и так последней версии
-		if newJob.IsUpdated() {
-			continue
 		}
 
 		tasks = append(tasks, newJob)
@@ -145,6 +112,66 @@ func getTasks(files []string) ([]*Task, error) {
 	}
 
 	return tasks, nil
+}
+
+func (apps *AppsInstalled) Serialize() (string, []*byte, error) {
+	ua := &appsinstalled.UserApps{
+		Lat: apps.Lat,
+		Lon: apps.Lon,
+		Apps: apps.Apps
+		}
+
+	packed, err := proto.Marshal(ua)
+	if err != nil {
+		log.Fatal("Marshaling error: ", err)
+	}
+
+	key := fmt.Sprintf("%s:%s", apps.DeviceType, apps.DeviceID)
+
+	return key, packed, err
+}
+
+func ParseAppInstalled(line string) (*AppsInstalled, error) {
+	lineparts := strings.Fields(line)
+	err := nil
+	if len(parts) < 5 {
+		return nil, errors.New("Invalid line `%s`", line)
+	}
+	devicetype := lineparts[0]
+	deviceid := lineparts[1]
+
+	lat, err := strconv.ParseFloat(lineparts[2], 64)
+	if err != nil {
+		lat = 0
+		log.Printf("Invalid latitude: `%s`", lineparts[2])
+	}
+
+	lon, err := strconv.ParseFloat(lineparts[3], 64)
+	if err != nil {
+		lon = 0
+		log.Printf("Invalid longitude: `%s`", lineparts[3])
+	}
+
+	iscomma := func(c rune) bool {
+		return c == ','
+	}
+	stringApps := strings.FieldsFunc(lineparts[4], iscomma)
+	apps := make([]int)
+	for _, app range stringApps {
+		if appNumber, err := strconv.ParseInt(app, 10, 0); err == nil {
+			apps = append(apps, int(appNumber))
+		} else {
+			log.Fatalf("Invalid app number: `%s`", app)
+		}
+	}
+
+	return &AppsInstalled{
+		DeviceType: devicetype,
+		DeviceID: deviceid,
+		Lat: lat,
+		Lon: lon,
+		Apps: apps
+		}, nil
 }
 
 func main() {
@@ -162,7 +189,7 @@ func main() {
 	files, err = filepath.Glob(*pattern)
 
 	if err != nil {
-		fmt.Print("No matching for pattern. Exit.")
+		log.Fatal("No matching for pattern. Exit.")
 		os.Exit(1)
 	}
 
@@ -170,12 +197,12 @@ func main() {
 	tasks, err := getTasks(files)
 
 	if err != nil {
-		fmt.Print(err.Error())
+		log.Fatal(err.Error())
 		return
 	}
 
 	if tasks == nil || len(tasks) == 0 {
-		fmt.Print("No files to load.")
+		log.Fatal("No files to load.")
 		return
 	}
 
