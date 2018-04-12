@@ -2,24 +2,23 @@ package main
 
 import (
 	"appsinstalled"
+	"bufio"
+	"compress/gzip"
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/rainycape/memcache"
 )
-
-// Структура для хранения задачи в процессе ее выполнения
-type Task struct {
-	wg        *sync.WaitGroup
-	Attempt   int
-	Name      string
-	Error     error
-	isSuccess bool
-}
 
 // Структура, в которой храниться распаршенная запись из файла логов
 type AppsInstalled struct {
@@ -30,92 +29,114 @@ type AppsInstalled struct {
 	Apps       []uint32
 }
 
-// Проверка что задача завершена. Либо успешно выполнена, либо закончились попытки
-func (task *Task) IsFinished() bool {
-	if task.isSuccess {
-		return true
+type ProtobufMes struct {
+	Key   string
+	Value *[]byte
+}
+
+func dotRename(path string) {
+	dotNamePath := filepath.Join(filepath.Dir(path), ".", filepath.Base(path))
+	err := os.Rename(path, dotNamePath)
+	if err != nil {
+		log.Print(err)
+	} else {
+		log.Printf("File renamed to %s", dotNamePath)
 	}
 
-	if task.Attempt > 5 { // @TODO: Config?
-		return true
+}
+
+// создание задач
+func dispatch(files []string, devices *map[string]*string, attempts int, dry bool, timeOut int) {
+	var wg sync.WaitGroup
+	quit := make(chan bool)
+
+	//clients := make(map[string]*memcache.Client, len(*devices))
+	messages := make(map[string]chan *ProtobufMes, len(*devices))
+	for devType, addr := range *devices {
+		client, err := memcache.New(*addr)
+		if err != nil {
+			log.Fatalf("Memcache client {%s} not created: %s", *addr, err)
+			return
+		}
+		client.SetTimeout(time.Duration(timeOut))
+		messages[devType] = make(chan *ProtobufMes)
+		//clients[devType] = client
+		go memcWrite(*addr, client, messages[devType], &quit, attempts, dry)
 	}
 
-	return false
+	wg.Add(len(files))
+
+	sort.Strings(files)
+	for _, file := range files {
+		go func() {
+			readWorker(file, messages, &wg)
+			dotRename(file)
+		}()
+	}
+	close(quit)
+	wg.Wait()
 }
 
-// Вызывается при неуспешном завершении.
-// Инкрементит количество попыток и запоминает ошибку
-func (task *Task) Fail(err error) {
-	task.Attempt++
-	task.Error = err
+func readWorker(source string, messages map[string]chan *ProtobufMes, wg *sync.WaitGroup) {
+	reader, err := os.Open(source)
+	if err != nil {
+		log.Fatalf("Error opening the file %s: %s", source, err)
+		wg.Done()
+		return
+	}
+	archive, err := gzip.NewReader(reader)
+	if err != nil {
+		log.Fatalf("Invalid gzip file %s: %s", source, err)
+		wg.Done()
+		return
+	}
+	scanner := bufio.NewScanner(archive)
+	for scanner.Scan() {
+		line := scanner.Text()
+		apps, err := ParseAppInstalled(line)
+		mes, err := apps.Serialize()
+		if err != nil {
+			continue
+			//error++    @TODO
+		}
+		messages[apps.DeviceType] <- mes
+	}
+	wg.Done()
+	archive.Close()
+	reader.Close()
 }
 
-// Помечает задачу как выполненную. При этом нужно создать файл с mtime
-func (task *Task) Success() {
-	task.Error = nil
-	task.isSuccess = true
-}
-
-// Горутина-воркер. Берет из queue задачу и пытается обработать.
-// В результате либо завершает ее, либо кладет в конец очереди на повторную обработку
-/* func worker(queue chan *Task, exit chan bool) {
+func memcWrite(addr string, client *memcache.Client, messages chan *ProtobufMes, quit *chan bool, attempts int, dry bool) {
+	counter := attempts > 0
 	for {
 		select {
-		case task := <-queue:
-			task.logger.Info("start")
-			if err := handleFile(task.DataRoot, task.URL); err != nil {
-				task.Fail(err)
-				task.logger.Info("fail", zap.Int("attempt", task.Attempt), zap.Error(err))
-			} else {
-				task.Success()
-				task.logger.Info("success")
+		case mes := <-messages:
+			if dry {
+				log.Printf("%s - {%s:%s}", addr, mes.Key, *mes.Value)
+				return
+			}
+			for {
+				err := client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
+				if err != nil {
+					if counter {
+						attempts--
+					} else {
+						continue
+					}
+				} else {
+					break
+				}
+				if attempts == 0 {
+					log.Printf("Could not write to memcache %s: %s", addr, err)
+					break
+				}
 			}
 
-			if task.IsFinished() {
-				task.Done()
-			} else {
-				queue <- task
-			}
-		case <-exit:
+		case <-*quit:
 			return
 		}
 	}
-} */
 
-// создание задач
-/* func GetTasks(files []string) ([]*Task, error) {
-	var wg sync.WaitGroup
-	tasks := make([]*Task, 0)
-
-	for _, file := range files {
-		newJob := &Task{
-			wg:   &wg,
-			Name: file.Name,
-		}
-
-		tasks = append(tasks, newJob)
-		wg.Add(1)
-	}
-
-	return tasks, nil
-} */
-
-// Serialize сериализует protobuf-сообщение из структуры AppsInstalled
-func (apps *AppsInstalled) Serialize() (string, *[]byte, error) {
-	ua := &appsinstalled.UserApps{
-		Lat:  &apps.Lat,
-		Lon:  &apps.Lon,
-		Apps: apps.Apps,
-	}
-
-	packed, err := proto.Marshal(ua)
-	if err != nil {
-		log.Fatal("Marshaling error: ", err)
-	}
-
-	key := fmt.Sprintf("%s:%s", apps.DeviceType, apps.DeviceID)
-
-	return key, &packed, err
 }
 
 // ParseAppInstalled парсит строку и возвращает структуру типа AppsInstalled
@@ -159,6 +180,25 @@ func ParseAppInstalled(line string) (*AppsInstalled, error) {
 		Lon:        lon,
 		Apps:       apps,
 	}, nil
+}
+
+// Serialize сериализует protobuf-сообщение из структуры AppsInstalled
+func (apps *AppsInstalled) Serialize() (*ProtobufMes, error) {
+	ua := &appsinstalled.UserApps{
+		Lat:  &apps.Lat,
+		Lon:  &apps.Lon,
+		Apps: apps.Apps,
+	}
+
+	packed, err := proto.Marshal(ua)
+	if err != nil {
+		log.Fatal("Marshaling error: ", err)
+		return nil, err
+	}
+
+	key := fmt.Sprintf("%s:%s", apps.DeviceType, apps.DeviceID)
+
+	return &ProtobufMes{Key: key, Value: &packed}, err
 }
 
 func prototest() bool {
@@ -221,11 +261,14 @@ func main() {
 	memcDevice["gaid"] = flag.String("gaid", "127.0.0.1:33014", "memcGaid")
 	memcDevice["adid"] = flag.String("adid", "127.0.0.1:33015", "memcAdid")
 	memcDevice["dvid"] = flag.String("dvid", "127.0.0.1:33016", "memcDvid")
-	/* 	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern")
-	   	numProc := flag.Int("numProc", 4, "number of CPU")
-	   	attempts := flag.Int("attempts", 0, "attempts")
-	   	dryRun := flag.Bool("dryRun", false, "dry run mode") */
+	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern")
+	numProc := flag.Int("numProc", 4, "number of CPU")
+	attempts := flag.Int("attempts", 0, "attempts")
+	dryRun := flag.Bool("dryRun", false, "dry run mode")
 	test := flag.Bool("test", false, "test run mode")
+	timeOut := flag.Int("timeout", 3, "timeout")
+
+	log.Print("Memcload started.")
 
 	flag.Parse()
 
@@ -238,46 +281,15 @@ func main() {
 		return
 	}
 
-	/* 	runtime.GOMAXPROCS(*numProc)
+	runtime.GOMAXPROCS(*numProc)
 
-	   	files, err := filepath.Glob(*pattern)
+	files, err := filepath.Glob(*pattern)
 
 	if err != nil {
 		log.Fatal("No matching for pattern. Exit.")
 		os.Exit(1)
 	}
 
-	// Составляет список задач
-	tasks, err := getTasks(files)
-
-	if err != nil {
-		log.Fatal(err.Error())
-		return
-	}
-
-	if tasks == nil || len(tasks) == 0 {
-		log.Fatal("No files to load.")
-		return
-	}
-
-	wg := tasks[0].wg
-
-	// делаем очередь задач из массива
-	queue := make(chan *Task, len(tasks))
-
-	for _, task := range tasks {
-		queue <- task
-	}
-
-	workerExit := make(chan bool)
-	defer close(workerExit)
-
-	for i := 0; i < cfg.Workers; i++ {
-		go func() {
-			worker(queue, workerExit)
-		}()
-	}
-
-	// ожидать завершение всех воркеров
-	   	wg.Wait() */
+	dispatch(files, &memcDevice, *attempts, *dryRun, *timeOut)
+	log.Print("Done.")
 }
