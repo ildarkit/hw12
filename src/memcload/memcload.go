@@ -61,6 +61,8 @@ func stats(errors chan counters, threshold float64) {
 	errorsRatio := float64(errCounts) / float64(allCounts)
 	if errorsRatio > threshold {
 		log.Printf("Many errors occurred: %f > %f.", errorsRatio, threshold)
+	} else {
+		log.Printf("The number of errors did not exceed the threshold value: %f < %f.", errorsRatio, threshold)
 	}
 
 }
@@ -81,7 +83,6 @@ func dispatch(files []string, devices *map[string]*string,
 		}
 		client.SetTimeout(time.Duration(timeOut) * time.Millisecond)
 		messages[devType] = make(chan *ProtobufMes)
-		log.Printf("Memcache client ready to connect %s.", *addr)
 		go memcWrite(*addr, client, messages[devType], &quit, attempts, dry)
 	}
 
@@ -115,6 +116,7 @@ func readWorker(source string, messages map[string]chan *ProtobufMes,
 	allCount := 0
 	errCount := 0
 	scanner := bufio.NewScanner(archive)
+	log.Printf("Reading from file <%s>.", source)
 	for scanner.Scan() {
 		line := scanner.Text()
 		apps, err := ParseAppInstalled(line)
@@ -126,6 +128,7 @@ func readWorker(source string, messages map[string]chan *ProtobufMes,
 		}
 		messages[apps.DeviceType] <- mes
 	}
+	log.Printf("Read from file <%s> is complete.", source)
 
 	errors <- counters{all: allCount, err: errCount}
 
@@ -140,6 +143,7 @@ func memcWrite(addr string, client *memcache.Client,
 	var err error
 	var mes *ProtobufMes
 	counter := attempts > 0
+	log.Printf("Started writing to memcache %s.", addr)
 	for {
 		select {
 		case mes = <-messages:
@@ -294,7 +298,7 @@ func main() {
 	memcDevice["gaid"] = flag.String("gaid", "127.0.0.1:33014", "memcGaid")
 	memcDevice["adid"] = flag.String("adid", "127.0.0.1:33015", "memcAdid")
 	memcDevice["dvid"] = flag.String("dvid", "127.0.0.1:33016", "memcDvid")
-	pattern := flag.String("pattern", "D:\\otus_python\\hw9\\data\\appinstalled\\*.tsv.gz", "File name pattern")
+	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "File name pattern")
 	numProc := flag.Int("procs", 4, "Number of go processors")
 	attempts := flag.Int("attempts", 0, "Number of attempts before surrendering (0 - endless)")
 	dryRun := flag.Bool("dry", false, "Dry run mode")
