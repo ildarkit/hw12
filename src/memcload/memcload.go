@@ -34,8 +34,14 @@ type ProtobufMes struct {
 	Value *[]byte
 }
 
+type counters struct {
+	all int
+	err int
+}
+
 func dotRename(path string) {
-	dotNamePath := filepath.Join(filepath.Dir(path), ".", filepath.Base(path))
+	head, tail := filepath.Split(path)
+	dotNamePath := filepath.Join(head, "."+tail)
 	err := os.Rename(path, dotNamePath)
 	if err != nil {
 		log.Print(err)
@@ -45,12 +51,27 @@ func dotRename(path string) {
 
 }
 
+func stats(errors chan counters, threshold float64) {
+	allCounts := 0
+	errCounts := 0
+	for counts := range errors {
+		allCounts += counts.all
+		errCounts += counts.err
+	}
+	errorsRatio := float64(errCounts) / float64(allCounts)
+	if errorsRatio > threshold {
+		log.Printf("Many errors occurred: %f > %f.", errorsRatio, threshold)
+	}
+
+}
+
 // создание задач
-func dispatch(files []string, devices *map[string]*string, attempts int, dry bool, timeOut int) {
+func dispatch(files []string, devices *map[string]*string,
+	attempts int, dry bool, timeOut int, threshold float64) {
 	var wg sync.WaitGroup
 	quit := make(chan bool)
+	errors := make(chan counters)
 
-	//clients := make(map[string]*memcache.Client, len(*devices))
 	messages := make(map[string]chan *ProtobufMes, len(*devices))
 	for devType, addr := range *devices {
 		client, err := memcache.New(*addr)
@@ -58,9 +79,9 @@ func dispatch(files []string, devices *map[string]*string, attempts int, dry boo
 			log.Fatalf("Memcache client {%s} not created: %s", *addr, err)
 			return
 		}
-		client.SetTimeout(time.Duration(timeOut))
+		client.SetTimeout(time.Duration(timeOut) * time.Millisecond)
 		messages[devType] = make(chan *ProtobufMes)
-		//clients[devType] = client
+		log.Printf("Memcache client ready to connect %s.", *addr)
 		go memcWrite(*addr, client, messages[devType], &quit, attempts, dry)
 	}
 
@@ -68,58 +89,70 @@ func dispatch(files []string, devices *map[string]*string, attempts int, dry boo
 
 	sort.Strings(files)
 	for _, file := range files {
-		go func() {
-			readWorker(file, messages, &wg)
-			dotRename(file)
-		}()
+		go readWorker(file, messages, &wg, errors)
 	}
-	close(quit)
+
+	go stats(errors, threshold)
+
 	wg.Wait()
+	close(quit)
 }
 
-func readWorker(source string, messages map[string]chan *ProtobufMes, wg *sync.WaitGroup) {
+func readWorker(source string, messages map[string]chan *ProtobufMes,
+	wg *sync.WaitGroup, errors chan counters) {
 	reader, err := os.Open(source)
 	if err != nil {
-		log.Fatalf("Error opening the file %s: %s", source, err)
+		log.Printf("Error opening the file %s: %s", source, err)
 		wg.Done()
 		return
 	}
 	archive, err := gzip.NewReader(reader)
 	if err != nil {
-		log.Fatalf("Invalid gzip file %s: %s", source, err)
+		log.Printf("Invalid gzip file %s: %s", source, err)
 		wg.Done()
 		return
 	}
+	allCount := 0
+	errCount := 0
 	scanner := bufio.NewScanner(archive)
 	for scanner.Scan() {
 		line := scanner.Text()
 		apps, err := ParseAppInstalled(line)
 		mes, err := apps.Serialize()
+		allCount++
 		if err != nil {
+			errCount++
 			continue
-			//error++    @TODO
 		}
 		messages[apps.DeviceType] <- mes
 	}
+
+	errors <- counters{all: allCount, err: errCount}
+
 	wg.Done()
 	archive.Close()
 	reader.Close()
+	dotRename(source)
 }
 
-func memcWrite(addr string, client *memcache.Client, messages chan *ProtobufMes, quit *chan bool, attempts int, dry bool) {
+func memcWrite(addr string, client *memcache.Client,
+	messages chan *ProtobufMes, quit *chan bool, attempts int, dry bool) {
+	var err error
+	var mes *ProtobufMes
 	counter := attempts > 0
 	for {
 		select {
-		case mes := <-messages:
+		case mes = <-messages:
 			if dry {
-				log.Printf("%s - {%s:%s}", addr, mes.Key, *mes.Value)
+				log.Printf("%s - %q", addr, *mes)
 			} else {
 				for {
-					err := client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
+					err = client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
 					if err != nil {
 						if counter {
 							attempts--
 						} else {
+							log.Print(err)
 							continue
 						}
 					} else {
@@ -169,7 +202,7 @@ func ParseAppInstalled(line string) (*AppsInstalled, error) {
 		if appNumber, err := strconv.ParseUint(app, 10, 32); err == nil {
 			apps = append(apps, uint32(appNumber))
 		} else {
-			log.Fatalf("Invalid app number: `%s`", app)
+			log.Printf("Invalid app number: `%s`", app)
 		}
 	}
 
@@ -192,7 +225,7 @@ func (apps *AppsInstalled) Serialize() (*ProtobufMes, error) {
 
 	packed, err := proto.Marshal(ua)
 	if err != nil {
-		log.Fatal("Marshaling error: ", err)
+		log.Printf("Marshaling error: %s", err)
 		return nil, err
 	}
 
@@ -261,12 +294,13 @@ func main() {
 	memcDevice["gaid"] = flag.String("gaid", "127.0.0.1:33014", "memcGaid")
 	memcDevice["adid"] = flag.String("adid", "127.0.0.1:33015", "memcAdid")
 	memcDevice["dvid"] = flag.String("dvid", "127.0.0.1:33016", "memcDvid")
-	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern")
-	numProc := flag.Int("numProc", 4, "number of CPU")
-	attempts := flag.Int("attempts", 0, "attempts")
-	dryRun := flag.Bool("dryRun", false, "dry run mode")
-	test := flag.Bool("test", false, "test run mode")
-	timeOut := flag.Int("timeout", 3, "timeout")
+	pattern := flag.String("pattern", "D:\\otus_python\\hw9\\data\\appinstalled\\*.tsv.gz", "File name pattern")
+	numProc := flag.Int("procs", 4, "Number of go processors")
+	attempts := flag.Int("attempts", 0, "Number of attempts before surrendering (0 - endless)")
+	dryRun := flag.Bool("dry", false, "Dry run mode")
+	test := flag.Bool("test", false, "Test run mode")
+	timeOut := flag.Int("timeout", 300, "Socket read/write timeout (msec)")
+	threshold := flag.Float64("threshold", 0.001, "Threshold error value")
 
 	log.Print("Memcload started.")
 
@@ -283,13 +317,25 @@ func main() {
 
 	runtime.GOMAXPROCS(*numProc)
 
-	files, err := filepath.Glob(*pattern)
+	patternFiles, err := filepath.Glob(*pattern)
 
-	if err != nil {
-		log.Print("No matching for pattern. Exit.")
+	if err != nil || len(patternFiles) == 0 {
+		log.Print("Could not get list of files.")
 		os.Exit(1)
 	}
+	files := make([]string, 0)
+	for _, path := range patternFiles {
+		_, name := filepath.Split(path)
+		if name[:1] != "." {
+			files = append(files, path)
+		}
+	}
 
-	dispatch(files, &memcDevice, *attempts, *dryRun, *timeOut)
+	if len(files) == 0 {
+		log.Print("Files not found. Exit.")
+		os.Exit(2)
+	}
+
+	dispatch(files, &memcDevice, *attempts, *dryRun, *timeOut, *threshold)
 	log.Print("Done.")
 }
