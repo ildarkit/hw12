@@ -113,22 +113,22 @@ func memcWrite(addr string, client *memcache.Client, messages chan *ProtobufMes,
 		case mes := <-messages:
 			if dry {
 				log.Printf("%s - {%s:%s}", addr, mes.Key, *mes.Value)
-				return
-			}
-			for {
-				err := client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
-				if err != nil {
-					if counter {
-						attempts--
+			} else {
+				for {
+					err := client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
+					if err != nil {
+						if counter {
+							attempts--
+						} else {
+							continue
+						}
 					} else {
-						continue
+						break
 					}
-				} else {
-					break
-				}
-				if attempts == 0 {
-					log.Printf("Could not write to memcache %s: %s", addr, err)
-					break
+					if attempts == 0 {
+						log.Printf("Could not write to memcache %s: %s", addr, err)
+						break
+					}
 				}
 			}
 
@@ -286,7 +286,7 @@ func main() {
 	files, err := filepath.Glob(*pattern)
 
 	if err != nil {
-		log.Fatal("No matching for pattern. Exit.")
+		log.Print("No matching for pattern. Exit.")
 		os.Exit(1)
 	}
 
