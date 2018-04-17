@@ -72,6 +72,7 @@ func dispatch(files []string, devices *map[string]*string,
 	attempts int, dry bool, timeOut int, threshold float64) {
 	var wg sync.WaitGroup
 	quit := make(chan bool)
+	defer close(quit)
 	errors := make(chan counters)
 
 	messages := make(map[string]chan *ProtobufMes, len(*devices))
@@ -83,7 +84,8 @@ func dispatch(files []string, devices *map[string]*string,
 		}
 		client.SetTimeout(time.Duration(timeOut) * time.Millisecond)
 		messages[devType] = make(chan *ProtobufMes)
-		go memcWrite(*addr, client, messages[devType], &quit, attempts, dry)
+		log.Printf("Started writing to memcache %s.", *addr)
+		go memcWrite(client, messages[devType], quit, attempts, dry)
 	}
 
 	wg.Add(len(files))
@@ -96,27 +98,31 @@ func dispatch(files []string, devices *map[string]*string,
 	go stats(errors, threshold)
 
 	wg.Wait()
-	close(quit)
+
+	for _, file := range files {
+		dotRename(file)
+	}
 }
 
 func readWorker(source string, messages map[string]chan *ProtobufMes,
 	wg *sync.WaitGroup, errors chan counters) {
+	defer wg.Done()
 	reader, err := os.Open(source)
 	if err != nil {
 		log.Printf("Error opening the file %s: %s", source, err)
-		wg.Done()
 		return
 	}
+	defer reader.Close()
 	archive, err := gzip.NewReader(reader)
 	if err != nil {
 		log.Printf("Invalid gzip file %s: %s", source, err)
-		wg.Done()
 		return
 	}
+	defer archive.Close()
 	allCount := 0
 	errCount := 0
 	scanner := bufio.NewScanner(archive)
-	log.Printf("Reading from file <%s>.", source)
+	log.Printf("Reading from a file <%s>.", source)
 	for scanner.Scan() {
 		line := scanner.Text()
 		apps, err := ParseAppInstalled(line)
@@ -131,24 +137,18 @@ func readWorker(source string, messages map[string]chan *ProtobufMes,
 	log.Printf("Read from file <%s> is complete.", source)
 
 	errors <- counters{all: allCount, err: errCount}
-
-	wg.Done()
-	archive.Close()
-	reader.Close()
-	dotRename(source)
 }
 
-func memcWrite(addr string, client *memcache.Client,
-	messages chan *ProtobufMes, quit *chan bool, attempts int, dry bool) {
+func memcWrite(client *memcache.Client,
+	messages chan *ProtobufMes, quit chan bool, attempts int, dry bool) {
 	var err error
 	var mes *ProtobufMes
 	counter := attempts > 0
-	log.Printf("Started writing to memcache %s.", addr)
 	for {
 		select {
 		case mes = <-messages:
 			if dry {
-				log.Printf("%s - %q", addr, *mes)
+				log.Printf("%q", *mes)
 			} else {
 				for {
 					err = client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
@@ -163,13 +163,13 @@ func memcWrite(addr string, client *memcache.Client,
 						break
 					}
 					if attempts == 0 {
-						log.Printf("Could not write to memcache %s: %s", addr, err)
+						log.Printf("Could not write to memcache: %s", err)
 						break
 					}
 				}
 			}
 
-		case <-*quit:
+		case <-quit:
 			return
 		}
 	}
