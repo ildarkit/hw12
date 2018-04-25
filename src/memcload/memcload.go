@@ -85,7 +85,7 @@ func dispatch(files []string, devices *map[string]*string,
 		client.SetTimeout(time.Duration(timeOut) * time.Millisecond)
 		messages[devType] = make(chan *ProtobufMes)
 		log.Printf("Started writing to memcache %s.", *addr)
-		go memcWrite(client, messages[devType], quit, attempts, dry)
+		go writeWorker(client, messages[devType], quit, attempts, dry)
 	}
 
 	wg.Add(len(files))
@@ -139,41 +139,38 @@ func readWorker(source string, messages map[string]chan *ProtobufMes,
 	errors <- counters{all: allCount, err: errCount}
 }
 
-func memcWrite(client *memcache.Client,
+func writeWorker(client *memcache.Client,
 	messages chan *ProtobufMes, quit chan bool, attempts int, dry bool) {
 	var err error
+	var counter int
 	var mes *ProtobufMes
-	counter := attempts > 0
+	isCounter := attempts > 0
 	for {
 		select {
 		case mes = <-messages:
 			if dry {
 				log.Printf("%q", *mes)
-			} else {
-				for {
-					err = client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
-					if err != nil {
-						if counter {
-							attempts--
-						} else {
-							log.Print(err)
-							continue
-						}
-					} else {
-						break
-					}
-					if attempts == 0 {
-						log.Printf("Could not write to memcache: %s", err)
-						break
-					}
+				continue
+			}
+			counter = attempts
+			for {
+				err = client.Set(&memcache.Item{Key: mes.Key, Value: *mes.Value})
+				if err == nil {
+					break
+				}
+				log.Print(err)
+				if isCounter {
+					counter--
+				}
+				if counter == 0 {
+					log.Printf("Could not write to memcache: %s", err)
+					break
 				}
 			}
-
 		case <-quit:
 			return
 		}
 	}
-
 }
 
 // ParseAppInstalled парсит строку и возвращает структуру типа AppsInstalled
@@ -300,7 +297,7 @@ func main() {
 	memcDevice["dvid"] = flag.String("dvid", "127.0.0.1:33016", "memcDvid")
 	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "File name pattern")
 	numProc := flag.Int("procs", 4, "Number of go processors")
-	attempts := flag.Int("attempts", 0, "Number of attempts before surrendering (0 - endless)")
+	attempts := flag.Int("attempts", 0, "Number of attempts before surrendering (attempts <= 0 - endless)")
 	dryRun := flag.Bool("dry", false, "Dry run mode")
 	test := flag.Bool("test", false, "Test run mode")
 	timeOut := flag.Int("timeout", 300, "Socket read/write timeout (msec)")
